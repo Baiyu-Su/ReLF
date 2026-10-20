@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Run outputs (Hydra run dirs, checkpoints, samples, logs)
+outputs/
+samples/
+logs/
+*.log
+
+# Generated per-checkpoint sample_eval configs (scripts/make_eval_configs.py)
+configs/eval_*_ck[0-9]*.yaml
+
+# Experiment results and analysis outputs
+results/
+
+# Secrets (WANDB_API_KEY etc.)
+.env
+
+paper/
+
+# IDE / OS
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

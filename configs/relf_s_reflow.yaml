@@ -1,0 +1,226 @@
+# relf_s_reflow: one round of regularized reflow (relf/reflow.py) on a trained relf_s checkpoint, in one train launch:
+# 1. collect: the teacher's EMA weights (reflow.teacher_path) map x0 ~ N(0, I) to tokens with this yaml's deterministic
+#    sampler (reflow.collect_steps steps at guidance scale reflow.collect_sc_guidance_scale) -> reflow.coupling_dir
+#    (existing shards are skipped);
+# 2. train: the student starts from the teacher's EMA weights and trains on the stored (x0, tokens) couplings;
+# 3. interp: theta = lam EMA(teacher) + (1 - lam) student (reflow.lam) -> <save_dir>/interp/checkpoint-<step>, which the
+#    final eval reads.
+# Everything else is the relf_s recipe. Set reflow.teacher_path and reflow.coupling_dir before launching.
+defaults:
+  - _self_
+
+mode: train  # train / sample_eval
+
+seed: 1
+
+# Experiment name; drives the wandb run name and the per-run output folder
+# (outputs/<run_name>_<date>_<slurmid>). Bump this for a new experiment.
+run_name: relf_s_reflow
+
+algo:
+  name: relf
+  backbone: dit
+  # Add the analytic singular logits (Gaussian posterior) to the network
+  # logits; the network then models only a bounded residual. See
+  # .claude/skills/relf/SKILL.md.
+  singular_logits: True
+  # Reference measure of the singular term = pi from the asset instead of
+  # uniform. Requires singular_logits.
+  singular_unigram_reference: True
+  # Vanilla self-conditioning: condition the backbone on its previous
+  # x1_hat (widened zero-init input_proj; bootstrap = stop-grad no-grad
+  # pass at the same (x_t, t)). Whole-run parameterization change.
+  self_cond: True
+  # Bootstrap probability of the conditioned mode; the complement trains
+  # the cold mode the sampler uses at step 0.
+  self_cond_p: 0.5
+  # Distilled self-conditioning guidance (ELF): the network is
+  # conditioned on a per-example scale w (log-uniform over 1 + w on
+  # [1 + omega_min, 1 + omega_max]); the CE sees the logits minus the
+  # stop-grad shift (1 - 1/w) keep (l_warm - l_cold).
+  sc_guidance: True
+  omega_min: 0.5
+  omega_max: 5.0
+
+model:
+  hidden_size: 768
+  cond_dim: 128
+  length: 1024
+  n_blocks: 12
+  n_heads: 12
+  dropout: 0.1
+  # The frozen d = 32 Hellinger-SVD embedding plus its own
+  # conditional-channel arc-length schedule (t_end from the asset). Frozen
+  # scale -- do not rescale the asset.
+  flow_dim: 32
+  token_embed_path: ${hydra:runtime.cwd}/assets/flow_embed_hsvd32s.pt
+  # GPT-style padded head: logits/head dim rounded up from the real vocab
+  # (50258 = 50257 BPE + [PAD]) to a GEMM/kernel-friendly 50304 = 64 * 786.
+  # Pure computational speedup: padded slots are masked to -inf everywhere
+  # logits define a distribution and get exactly zero gradient. null disables.
+  vocab_padded_size: 50304
+  # Single global torch.compile switch: compiles the whole DiT or nothing.
+  compile: True
+  # Elementwise sigmoid gate on the attention output before attn_out,
+  # computed from the normalized and modulated attention input (the G1 variant of Qiu et al. 2025).
+  gated_attention: True
+
+data:
+  train: openwebtext-train
+  valid: openwebtext-valid
+  tokenizer_name_or_path: gpt2
+  cache_dir: ${hydra:runtime.cwd}/data/owt  # tokenized OpenWebText cache; point at a large disk
+  insert_train_eos: True
+  insert_valid_eos: True
+
+loader:
+  global_batch_size: 1024
+  eval_global_batch_size: 512
+  # Per-GPU (per-device) micro batch sizes, set explicitly rather than derived
+  # from global_batch_size / devices. get_datasets asserts consistency:
+  # global_batch_size == batch_size * num_nodes * num_gpus * accumulate_grad_batches.
+  batch_size: 128
+  eval_batch_size: 64
+  num_workers: 8
+  pin_memory: True
+
+sampling:
+  steps: [256]
+  # Uniform Euler grid (linspace on [0, 1], argmax decode at the last interior
+  # node) for the in-run and final evals.
+  grid: uniform
+  num_sample_batches: 1  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
+  num_final_eval_batches: 2  # Batches per step count in the final (post-training) eval: 2 x 8 x 64 = 1024 samples.
+  num_sample_log: 2
+  # Self-conditioning guidance scale fed at every sampling forward. 1.0 = plain
+  # self-conditioning (no guidance); the w
+  # sweep runs as eval cells `_scw<w>` (scripts/make_eval_configs.py).
+  sc_guidance_scale: 1.0
+
+# Inference-only sampler variants, set by the eval cells of
+# scripts/make_eval_configs.py; these defaults = the plain warm-carry Euler sampler of the in-run eval.
+eval_sampler:
+  solver: euler             # euler | heun (2 NFE/step, uniform grid) | sde
+  carry_mode: warm          # self-conditioning carry: warm | cold (stays at the step-0 zeros)
+  sde_noise_scale: 1.0
+  sde_noise_decay: 1.0
+  momentum_guidance: False
+  mg_alpha: 0.0
+  mg_beta: 0.8
+  x1_extrap: 0.0            # second-order x1 extrapolation coefficient c (0 = off)
+  grid_midpoint: False
+  grid_a: null              # sampling.grid knots only: pinned endpoints + flat knot list u1, v1, ...
+  grid_b: null
+  grid_knots: null
+  state_form: z             # z | mh; the knobs below need mh
+  sde_eta_gate: null        # flat (t, gain) knot list
+  sde_mix_gate: null
+  sde_gate_normalize: False
+  decode_t: null            # null = the last grid node
+  eta_strat: 'off'          # 'off' | std
+
+training:
+  ema: 0.9999
+  antithetic_sampling: True
+  # Draw t from the frozen asset's information-arc-length LUT, on [0, t_end].
+  # Same stratified/antithetic slot; the per-token CE stays unweighted.
+  # Plain LUT density, with no uniform floor; inference remains uniform.
+  t_sampling: arc_length
+
+eval:
+  checkpoint_path: ''  # Used to evaluate a checkpoint after training.
+  do_final_eval: True  # Low-variance final eval (EMA weights, num_final_eval_batches) after training.
+  disable_ema: False
+  compute_generative_perplexity: True  # gen-ppl and entropy switch independently; both need generate_samples
+  compute_entropy: True
+  perplexity_batch_size: 8
+  gen_ppl_eval_model_name_or_path: gpt2-large  # GPT-2 family only (metrics.py)
+  generate_samples: True
+  generated_samples_path: ${cwd:}/samples.json
+
+optim:
+  # optim.name: 'adamw' or 'muon' (built in optimizers.py); muon = the
+  # Muon/AdamW split.
+  # Both groups share lr and the constant_with_warmup schedule: Muon uses
+  # adjust_lr_fn='match_rms_adamw', so there is no separate Muon lr.
+  # Muon decay 0.02, including the attention gates; AdamW decay stays 0.
+  # Muon takes hidden matrices, adaLN modulations, the time-MLP and the
+  # guidance-scale MLP; the
+  # widened self-conditioning input_proj and the LM head stay on AdamW.
+  name: muon
+  weight_decay: 0
+  lr: 3e-4
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1e-8
+  muon_momentum: 0.95
+  muon_nesterov: True
+  muon_ns_steps: 5
+  muon_weight_decay: 0.02
+
+# Consumed by main._build_training_args to construct
+# transformers.TrainingArguments. Steps are optimizer (global) steps.
+trainer:
+  # 2 nodes x 4 GPUs.
+  num_nodes: 2
+  # accumulate_grad_batches is set manually (not derived).
+  # get_datasets asserts, using the actual torch.cuda.device_count():
+  #   global_batch_size == batch_size * num_nodes * num_gpus * accumulate_grad_batches
+  # so any mismatch fails at startup. The real GPU count comes from
+  # torchrun --nproc_per_node.
+  accumulate_grad_batches: 1
+  gradient_clip_val: 1.0
+  precision: 'bf16'
+  max_steps: 4000
+  warmup_steps: 2500
+  log_every_n_steps: 100
+  val_check_interval: 1000
+
+wandb:
+  project: relf
+  notes: ReLF
+  group: null
+  job_type: null
+  name: ${run_name}
+  # No `id` key on purpose: the wandb run id is always auto-generated, so
+  # every submission (including resumes) is a separate, collision-free run.
+  tags:
+    - ${data.train}
+    - ${algo.name}
+
+hydra:
+  run:
+    # One dedicated folder per run: outputs/<run_name>_<date>_<slurmid>.
+    # SLURM_JOB_ID is shared by all torchrun workers in the allocation, so every
+    # rank resolves the same dir; falls back to TORCHELASTIC_RUN_ID then a
+    # timestamp for non-Slurm runs.
+    dir: ./outputs/${run_name}_${now:%Y%m%d}_${oc.env:SLURM_JOB_ID,${oc.env:TORCHELASTIC_RUN_ID,${now:%H%M%S}}}
+  job:
+    chdir: true
+
+checkpointing:
+  # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
+  save_dir: ${cwd:}
+  save_every_n_steps: 1000
+  resume_from_ckpt: false
+  # Resume is explicit only: to resume, set resume_from_ckpt: true AND point
+  # resume_ckpt_path at a specific checkpoint-XXXX dir. There is no
+  # auto-detection of the latest checkpoint; resume_from_ckpt: true with a
+  # null or nonexistent path raises an error.
+  resume_ckpt_path: null
+
+reflow:
+  # reflow.py. enabled: False = standard training (every other key ignored).
+  enabled: True
+  # Teacher checkpoint-XXXX (model.safetensors + ema.pt): the pairs' sampler, the student's init, the interp anchor.
+  teacher_path: null  # set to a trained relf_s checkpoint-<step> dir
+  # Pair shards (shard_<k:05d>.pt + META.json); a dir holding another teacher / sampler's pairs is refused.
+  coupling_dir: null  # set to a writable dir for the pair shards
+  num_pairs: 262144  # 256 shards
+  shard_size: 1024
+  collect_batch_size: 256  # sequences per sampler call per GPU
+  collect_steps: 128
+  collect_sc_guidance_scale: 1.0
+  seed_base: 100000  # shard k draws x0 from a CPU generator seeded seed_base + k
+  lam: 0.55  # regularized reflow: theta = lam EMA(teacher) + (1 - lam) student
+  interp_from: raw  # raw (the student's endpoint weights) or ema (the run's EMA)

@@ -1,0 +1,25 @@
+# Python 3.12, CUDA 13.x (no torchvision / torchaudio needed).
+torch==2.12.1+cu130
+accelerate==1.14.0
+datasets==3.6.0
+einops==0.8.1
+fsspec==2025.3.0
+huggingface_hub==0.36.0
+hf_transfer==0.1.9
+hydra-core==1.3.2
+numpy==2.3.2
+omegaconf==2.3.0
+packaging==25.0
+Requests==2.32.4
+rich==14.2.0
+tokenizers==0.22.1
+torchmetrics==1.8.2
+tqdm==4.67.1
+transformers==4.57.3
+triton==3.7.1
+wandb==0.23.1
+nvitop==1.3.2
+# flash-attn-4 must be installed separately due to build flags:
+# installed: flash-attn-4==0.0.1.dev1+g5835c733e (built from source, --no-build-isolation)
+# Kernel stack (quack rmsnorm/rotary/MLP/CE + FA4) tested on GB200 and GH200; verify attention on other
+# GPUs before large runs.
